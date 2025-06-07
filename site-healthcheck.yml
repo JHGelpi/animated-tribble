@@ -1,0 +1,70 @@
+---
+- name: Configure uptime monitor VM
+  hosts: uptime-monitor
+  become: true
+  vars:
+    check_script: /usr/local/bin/site-healthcheck.sh
+    log_file: /var/log/site-healthcheck.log
+    url: "https://data2insightsllc.com"
+    alert_email: wes@data2insightsllc.com
+  tasks:
+    - name: Install required packages
+      apt:
+        name: [curl, mailutils]
+        state: present
+        update_cache: yes
+
+    - name: Deploy health-check script
+      copy:
+        dest: "{{ check_script }}"
+        content: |
+          #!/usr/bin/env bash
+          LOG="{{ log_file }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "{{ url }}")
+          TIMESTAMP=$(date -Iseconds)
+          if [ "$STATUS" -ne 200 ]; then
+            echo "$TIMESTAMP - ERROR: HTTP $STATUS" >> "$LOG"
+            echo "Site returned $STATUS at $TIMESTAMP" | mail -s "SITE DOWN: {{ url }}" {{ alert_email }}
+          else
+            echo "$TIMESTAMP - OK" >> "$LOG"
+          fi
+        mode: '0755'
+
+    - name: Create systemd service
+      copy:
+        dest: /etc/systemd/system/site-healthcheck.service
+        content: |
+          [Unit]
+          Description=Check data2insightsllc.com health
+          
+          [Service]
+          Type=oneshot
+          ExecStart={{ check_script }}
+      notify: reload systemd
+
+    - name: Create systemd timer
+      copy:
+        dest: /etc/systemd/system/site-healthcheck.timer
+        content: |
+          [Unit]
+          Description=Run site-healthcheck every 5 minutes
+          
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=5min
+          AccuracySec=30s
+          
+          [Install]
+          WantedBy=timers.target
+      notify: reload systemd
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: enable and start timer
+      systemd:
+        name: site-healthcheck.timer
+        enabled: yes
+        state: started
