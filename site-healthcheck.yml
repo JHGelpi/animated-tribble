@@ -22,11 +22,12 @@
           LOG="{{ log_file }}"
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "{{ url }}")
           TIMESTAMP=$(date -Iseconds)
-          if [ "$STATUS" -ne 200 ]; then
+          # Treat any 2xx or 3xx HTTP status as success
+          if [[ "$STATUS" -ge 400 ]]; then
             echo "$TIMESTAMP - ERROR: HTTP $STATUS" >> "$LOG"
             echo "Site returned $STATUS at $TIMESTAMP" | mail -s "SITE DOWN: {{ url }}" {{ alert_email }}
           else
-            echo "$TIMESTAMP - OK" >> "$LOG"
+            echo "$TIMESTAMP - OK: HTTP $STATUS" >> "$LOG"
           fi
         mode: '0755'
 
