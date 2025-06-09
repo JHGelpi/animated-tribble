@@ -54,3 +54,9 @@ resource "google_compute_instance" "uptime_monitor" {
     ssh-keys = "${var.ssh_user}:${file(var.public_key_path)}"
   }
 }
+
+# Output
+output "uptime_monitor_ip" {
+  description = "The external IP of the uptime-monitor VM"
+  value       = google_compute_address.uptime_ip.address
+}
