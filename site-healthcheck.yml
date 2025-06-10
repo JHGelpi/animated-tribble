@@ -2,17 +2,59 @@
 - name: Configure uptime monitor VM
   hosts: uptime-monitor
   become: true
+  vars_files:
+  - group_vars/uptime-monitor/vault.yml
   vars:
     check_script: /usr/local/bin/site-healthcheck.sh
     log_file: /var/log/site-healthcheck.log
     url: "https://data2insightsllc.com"
     alert_email: wes@data2insightsllc.com
+    smtp_relay_host: smtp.gmail.com        # e.g. smtp provider hostname
+    smtp_relay_port: 587                   # SMTP port (usually 587 TLS)
+    smtp_relay_user: wes@data2insightsllc.com  # SMTP auth username
+    smtp_relay_pass: "{{ smtp_relay_pass }}"       # SMTP auth password
   tasks:
+    - name: Preseed Postfix for outbound email
+      debconf:
+        name: postfix
+        question: "postfix/main_mailer_type"
+        value: "Internet Site"
+        vtype: string
+      debconf:
+        name: postfix
+        question: "postfix/mailname"
+        value: "{{ ansible_fqdn }}"
+        vtype: string
+
     - name: Install required packages
       apt:
-        name: [curl, mailutils]
+        name: [curl, mailutils, postfix]
         state: present
         update_cache: yes
+
+    - name: Create Postfix SASL password file
+      copy:
+        dest: /etc/postfix/sasl_passwd
+        content: |
+          [{{ smtp_relay_host }}]:{{ smtp_relay_port }}    {{ smtp_relay_user }}:{{ smtp_relay_pass }}
+        mode: '0600'
+
+    - name: Hash the SASL password file
+      command: postmap /etc/postfix/sasl_passwd
+      args:
+        creates: /etc/postfix/sasl_passwd.db
+
+    - name: Configure Postfix to use external SMTP relay
+      blockinfile:
+        dest: /etc/postfix/main.cf
+        marker: "# {mark} MONITOR RELAY"
+        block: |
+          relayhost = [{{ smtp_relay_host }}]:{{ smtp_relay_port }}
+          smtp_sasl_auth_enable = yes
+          smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+          smtp_sasl_security_options = noanonymous
+          smtp_tls_security_level = encrypt
+          smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
 
     - name: Deploy health-check script
       copy:
@@ -22,8 +64,8 @@
           LOG="{{ log_file }}"
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "{{ url }}")
           TIMESTAMP=$(date -Iseconds)
-          # Treat any 2xx or 3xx HTTP status as success
-          if [[ "$STATUS" -ge 400 ]]; then
+          # Treat any 2xx or 3xx HTTP status as success; but treat 000 (curl failure) as error
+          if [[ "$STATUS" == "000" || "$STATUS" -ge 400 ]]; then
             echo "$TIMESTAMP - ERROR: HTTP $STATUS" >> "$LOG"
             echo "Site returned $STATUS at $TIMESTAMP" | mail -s "SITE DOWN: {{ url }}" {{ alert_email }}
           else
