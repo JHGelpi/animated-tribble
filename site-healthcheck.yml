@@ -2,112 +2,154 @@
 - name: Configure uptime monitor VM
   hosts: uptime-monitor
   become: true
-  vars_files:
-  - group_vars/uptime-monitor/vault.yml
+  # Keep fact gathering and python interpreter vars as a best practice,
+  # even though we are bypassing most of their functionality.
+  gather_facts: false
   vars:
+    ansible_python_interpreter: /usr/bin/python3
     check_script: /usr/local/bin/site-healthcheck.sh
     log_file: /var/log/site-healthcheck.log
     url: "https://data2insightsllc.com"
-    alert_email: wes@data2insightsllc.com
-    smtp_relay_host: smtp.gmail.com        # e.g. smtp provider hostname
-    smtp_relay_port: 587                   # SMTP port (usually 587 TLS)
-    smtp_relay_user: wes@data2insightsllc.com  # SMTP auth username
-    smtp_relay_pass: "{{ smtp_relay_pass }}"       # SMTP auth password
+    alert_email: "wes@data2insightsllc.com"
+    smtp_relay_host: "smtp.gmail.com"
+    smtp_relay_port: 587
+    smtp_relay_user: "wes@data2insightsllc.com"
+  
+  # Note: vault variables will be injected from the command line
+  # using --ask-vault-pass and the vars_files lookup.
+  vars_files:
+  - group_vars/uptime-monitor/vault.yml
+
   tasks:
+    # -------------------------------------------------------------------------
+    # Bootstrap Phase: Prepare the system with dependencies
+    # -------------------------------------------------------------------------
+    - name: Bootstrap Python dependencies for Ansible
+      raw: DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y python3-six python3-apt python3-setuptools
+      register: bootstrap_result
+      changed_when: "'newly installed' in bootstrap_result.stdout"
+
+    - name: Get remote host FQDN
+      raw: hostname -f
+      register: fqdn_result
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Configuration Phase: All tasks use the 'raw' module
+    # -------------------------------------------------------------------------
     - name: Preseed Postfix for outbound email
-      debconf:
-        name: postfix
-        question: "postfix/main_mailer_type"
-        value: "Internet Site"
-        vtype: string
-      debconf:
-        name: postfix
-        question: "postfix/mailname"
-        value: "{{ ansible_fqdn }}"
-        vtype: string
+      raw: "echo 'postfix {{ item.question }} string {{ item.value }}' | debconf-set-selections"
+      loop:
+        - { question: 'postfix/main_mailer_type', value: 'Internet Site' }
+        - { question: 'postfix/mailname', value: '{{ fqdn_result.stdout | trim }}' }
+      register: preseed_result
+      changed_when: preseed_result.rc == 0
 
     - name: Install required packages
-      apt:
-        name: [curl, mailutils, postfix]
-        state: present
-        update_cache: yes
+      raw: DEBIAN_FRONTEND=noninteractive apt-get -y install curl mailutils postfix
+      register: apt_result
+      changed_when: "'newly installed' in apt_result.stdout"
 
     - name: Create Postfix SASL password file
-      copy:
-        dest: /etc/postfix/sasl_passwd
-        content: |
-          [{{ smtp_relay_host }}]:{{ smtp_relay_port }}    {{ smtp_relay_user }}:{{ smtp_relay_pass }}
-        mode: '0600'
+      raw: "printf '[%s]:%s\\t%s:%s' '{{ smtp_relay_host }}' '{{ smtp_relay_port }}' '{{ smtp_relay_user }}' '{{ smtp_relay_pass }}' > /etc/postfix/sasl_passwd"
+      register: sasl_file_result
+      changed_when: true # Always assume this needs to trigger a postmap
 
-    - name: Hash the SASL password file
-      command: postmap /etc/postfix/sasl_passwd
-      args:
-        creates: /etc/postfix/sasl_passwd.db
+    - name: Set permissions on SASL password file
+      raw: chmod 0600 /etc/postfix/sasl_passwd
 
     - name: Configure Postfix to use external SMTP relay
-      blockinfile:
-        dest: /etc/postfix/main.cf
-        marker: "# {mark} MONITOR RELAY"
-        block: |
-          relayhost = [{{ smtp_relay_host }}]:{{ smtp_relay_port }}
-          smtp_sasl_auth_enable = yes
-          smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
-          smtp_sasl_security_options = noanonymous
-          smtp_tls_security_level = encrypt
-          smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
+      raw: |
+        grep -q 'relayhost = \[{{ smtp_relay_host }}\]' /etc/postfix/main.cf || {
+          echo ''
+          echo '# {mark} MONITOR RELAY'
+          echo 'relayhost = [{{ smtp_relay_host }}]:{{ smtp_relay_port }}'
+          echo 'smtp_sasl_auth_enable = yes'
+          echo 'smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd'
+          echo 'smtp_sasl_security_options = noanonymous'
+          echo 'smtp_tls_security_level = encrypt'
+          echo 'smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt'
+        } >> /etc/postfix/main.cf
+      register: relay_config_result
+      changed_when: relay_config_result.rc == 0
+
+    - name: Ensure Postfix identifies as your custom domain
+      raw: |
+        grep -q 'myhostname = data2insightsllc.com' /etc/postfix/main.cf || {
+          echo ''
+          echo '# {mark} MONITOR HOSTNAME'
+          echo 'myhostname = data2insightsllc.com'
+          echo 'myorigin = data2insightsllc.com'
+        } >> /etc/postfix/main.cf
+      register: hostname_config_result
+      changed_when: hostname_config_result.rc == 0
 
     - name: Deploy health-check script
-      copy:
-        dest: "{{ check_script }}"
-        content: |
-          #!/usr/bin/env bash
-          LOG="{{ log_file }}"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "{{ url }}")
-          TIMESTAMP=$(date -Iseconds)
-          # Treat any 2xx or 3xx HTTP status as success; but treat 000 (curl failure) as error
-          if [[ "$STATUS" == "000" || "$STATUS" -ge 400 ]]; then
-            echo "$TIMESTAMP - ERROR: HTTP $STATUS" >> "$LOG"
-            echo "Site returned $STATUS at $TIMESTAMP" | mail -s "SITE DOWN: {{ url }}" {{ alert_email }}
-          else
-            echo "$TIMESTAMP - OK: HTTP $STATUS" >> "$LOG"
-          fi
-        mode: '0755'
+      raw: |
+        cat > {{ check_script }} <<'EOF'
+        #!/usr/bin/env bash
+        LOG="{{ log_file }}"
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "{{ url }}")
+        TIMESTAMP=$(date -Iseconds)
+        # Treat any 2xx or 3xx HTTP status as success; but treat 000 (curl failure) as error
+        if [[ "$STATUS" == "000" || "$STATUS" -ge 400 ]]; then
+          echo "$TIMESTAMP - ERROR: HTTP $STATUS" >> "$LOG"
+          echo "Site returned $STATUS at $TIMESTAMP" | mail -r "{{ alert_email }}" -s "SITE DOWN: {{ url }}" {{ alert_email }}
+        else
+          echo "$TIMESTAMP - OK: HTTP $STATUS" >> "$LOG"
+        fi
+        EOF
+      register: script_deploy_result
+      changed_when: true # Assume change to ensure permissions are set
 
-    - name: Create systemd service
-      copy:
-        dest: /etc/systemd/system/site-healthcheck.service
-        content: |
-          [Unit]
-          Description=Check data2insightsllc.com health
-          
-          [Service]
-          Type=oneshot
-          ExecStart={{ check_script }}
-      notify: reload systemd
+    - name: Set health-check script executable
+      raw: chmod 0755 {{ check_script }}
 
-    - name: Create systemd timer
-      copy:
-        dest: /etc/systemd/system/site-healthcheck.timer
-        content: |
-          [Unit]
-          Description=Run site-healthcheck every 5 minutes
-          
-          [Timer]
-          OnBootSec=2min
-          OnUnitActiveSec=5min
-          AccuracySec=30s
-          
-          [Install]
-          WantedBy=timers.target
-      notify: reload systemd
+    - name: Create systemd service file
+      raw: |
+        cat > /etc/systemd/system/site-healthcheck.service <<'EOF'
+        [Unit]
+        Description=Check data2insightsllc.com health
+        
+        [Service]
+        Type=oneshot
+        ExecStart={{ check_script }}
+        EOF
+      register: service_file_result
+      changed_when: true # Assume change to trigger daemon-reload
 
-  handlers:
-    - name: reload systemd
-      systemd:
-        daemon_reload: yes
+    - name: Create systemd timer file
+      raw: |
+        cat > /etc/systemd/system/site-healthcheck.timer <<'EOF'
+        [Unit]
+        Description=Run site-healthcheck every 5 minutes
+        
+        [Timer]
+        OnBootSec=2min
+        OnUnitActiveSec=5min
+        AccuracySec=30s
+        
+        [Install]
+        WantedBy=timers.target
+        EOF
+      register: timer_file_result
+      changed_when: true # Assume change to trigger daemon-reload and timer restart
 
-    - name: enable and start timer
-      systemd:
-        name: site-healthcheck.timer
-        enabled: yes
-        state: started
+    # -------------------------------------------------------------------------
+    # Handler Phase: Manually run service commands if changes occurred
+    # -------------------------------------------------------------------------
+    - name: Run postmap on SASL password file if it was created
+      raw: postmap /etc/postfix/sasl_passwd
+      when: sasl_file_result.changed
+
+    - name: Restart Postfix if configuration changed
+      raw: systemctl restart postfix
+      when: relay_config_result.changed or hostname_config_result.changed or sasl_file_result.changed
+
+    - name: Reload systemd if service files changed
+      raw: systemctl daemon-reload
+      when: service_file_result.changed or timer_file_result.changed
+
+    - name: Enable and start systemd timer if it was created
+      raw: systemctl enable --now site-healthcheck.timer
+      when: timer_file_result.changed
