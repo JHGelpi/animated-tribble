@@ -46,7 +46,7 @@
       changed_when: preseed_result.rc == 0
 
     - name: Install required packages
-      raw: DEBIAN_FRONTEND=noninteractive apt-get -y install curl mailutils postfix
+      raw: DEBIAN_FRONTEND=noninteractive apt-get -y install curl mailutils postfix ca-certificates
       register: apt_result
       changed_when: "'newly installed' in apt_result.stdout"
 
@@ -58,80 +58,93 @@
     - name: Set permissions on SASL password file
       raw: chmod 0600 /etc/postfix/sasl_passwd
 
+    # MODIFIED: This task now uses printf to avoid YAML syntax errors with heredocs.
     - name: Configure Postfix to use external SMTP relay
       raw: |
-        grep -q 'relayhost = \[{{ smtp_relay_host }}\]' /etc/postfix/main.cf || {
-          echo ''
-          echo '# {mark} MONITOR RELAY'
-          echo 'relayhost = [{{ smtp_relay_host }}]:{{ smtp_relay_port }}'
-          echo 'smtp_sasl_auth_enable = yes'
-          echo 'smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd'
-          echo 'smtp_sasl_security_options = noanonymous'
-          echo 'smtp_tls_security_level = encrypt'
-          echo 'smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt'
-        } >> /etc/postfix/main.cf
+        sed -i '/# {mark} MONITOR RELAY-START/,/# {mark} MONITOR RELAY-END/d' /etc/postfix/main.cf
+        (
+        printf '%s\n' \
+        '# {mark} MONITOR RELAY-START' \
+        'relayhost = [{{ smtp_relay_host }}]:{{ smtp_relay_port }}' \
+        'smtp_sasl_auth_enable = yes' \
+        'smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd' \
+        'smtp_sasl_security_options = noanonymous' \
+        'smtp_tls_security_level = encrypt' \
+        'smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt' \
+        'inet_protocols = ipv4' \
+        '# {mark} MONITOR RELAY-END'
+        ) >> /etc/postfix/main.cf
       register: relay_config_result
-      changed_when: relay_config_result.rc == 0
+      changed_when: true
 
+    # MODIFIED: This task now uses printf to avoid YAML syntax errors.
     - name: Ensure Postfix identifies as your custom domain
       raw: |
-        grep -q 'myhostname = data2insightsllc.com' /etc/postfix/main.cf || {
-          echo ''
-          echo '# {mark} MONITOR HOSTNAME'
-          echo 'myhostname = data2insightsllc.com'
-          echo 'myorigin = data2insightsllc.com'
-        } >> /etc/postfix/main.cf
+        sed -i '/# {mark} MONITOR HOSTNAME-START/,/# {mark} MONITOR HOSTNAME-END/d' /etc/postfix/main.cf
+        (
+        printf '%s\n' \
+        '# {mark} MONITOR HOSTNAME-START' \
+        'myhostname = data2insightsllc.com' \
+        'myorigin = data2insightsllc.com' \
+        '# {mark} MONITOR HOSTNAME-END'
+        ) >> /etc/postfix/main.cf
       register: hostname_config_result
-      changed_when: hostname_config_result.rc == 0
+      changed_when: true
 
+    # MODIFIED: This task now uses printf to avoid YAML syntax errors.
     - name: Deploy health-check script
       raw: |
-        cat > {{ check_script }} <<'EOF'
-        #!/usr/bin/env bash
-        LOG="{{ log_file }}"
-        STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "{{ url }}")
-        TIMESTAMP=$(date -Iseconds)
-        # Treat any 2xx or 3xx HTTP status as success; but treat 000 (curl failure) as error
-        if [[ "$STATUS" == "000" || "$STATUS" -ge 400 ]]; then
-          echo "$TIMESTAMP - ERROR: HTTP $STATUS" >> "$LOG"
-          echo "Site returned $STATUS at $TIMESTAMP" | mail -r "{{ alert_email }}" -s "SITE DOWN: {{ url }}" {{ alert_email }}
-        else
-          echo "$TIMESTAMP - OK: HTTP $STATUS" >> "$LOG"
-        fi
-        EOF
+        (
+        printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'LOG="{{ log_file }}"' \
+        'STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "{{ url }}")' \
+        'TIMESTAMP=$(date -Iseconds)' \
+        '# Treat any 2xx or 3xx HTTP status as success; but treat 000 (curl failure) as error' \
+        'if [[ "$STATUS" == "000" || "$STATUS" -ge 400 ]]; then' \
+        '  echo "$TIMESTAMP - ERROR: HTTP $STATUS" >> "$LOG"' \
+        '  echo "Site returned $STATUS at $TIMESTAMP" | mail -r "{{ alert_email }}" -s "SITE DOWN: {{ url }}" {{ alert_email }}' \
+        'else' \
+        '  echo "$TIMESTAMP - OK: HTTP $STATUS" >> "$LOG"' \
+        'fi'
+        ) > {{ check_script }}
       register: script_deploy_result
       changed_when: true # Assume change to ensure permissions are set
 
     - name: Set health-check script executable
       raw: chmod 0755 {{ check_script }}
 
+    # MODIFIED: This task now uses printf to avoid YAML syntax errors.
     - name: Create systemd service file
       raw: |
-        cat > /etc/systemd/system/site-healthcheck.service <<'EOF'
-        [Unit]
-        Description=Check data2insightsllc.com health
-        
-        [Service]
-        Type=oneshot
-        ExecStart={{ check_script }}
-        EOF
+        (
+        printf '%s\n' \
+        '[Unit]' \
+        'Description=Check data2insightsllc.com health' \
+        '' \
+        '[Service]' \
+        'Type=oneshot' \
+        'ExecStart={{ check_script }}'
+        ) > /etc/systemd/system/site-healthcheck.service
       register: service_file_result
       changed_when: true # Assume change to trigger daemon-reload
 
+    # MODIFIED: This task now uses printf to avoid YAML syntax errors.
     - name: Create systemd timer file
       raw: |
-        cat > /etc/systemd/system/site-healthcheck.timer <<'EOF'
-        [Unit]
-        Description=Run site-healthcheck every 5 minutes
-        
-        [Timer]
-        OnBootSec=2min
-        OnUnitActiveSec=5min
-        AccuracySec=30s
-        
-        [Install]
-        WantedBy=timers.target
-        EOF
+        (
+        printf '%s\n' \
+        '[Unit]' \
+        'Description=Run site-healthcheck every 5 minutes' \
+        '' \
+        '[Timer]' \
+        'OnBootSec=2min' \
+        'OnUnitActiveSec=5min' \
+        'AccuracySec=30s' \
+        '' \
+        '[Install]' \
+        'WantedBy=timers.target'
+        ) > /etc/systemd/system/site-healthcheck.timer
       register: timer_file_result
       changed_when: true # Assume change to trigger daemon-reload and timer restart
 
