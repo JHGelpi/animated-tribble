@@ -86,6 +86,7 @@
         '# {mark} MONITOR HOSTNAME-START' \
         'myhostname = data2insightsllc.com' \
         'myorigin = data2insightsllc.com' \
+        'mydestination = localhost.localdomain, localhost' \
         '# {mark} MONITOR HOSTNAME-END'
         ) >> /etc/postfix/main.cf
       register: hostname_config_result
